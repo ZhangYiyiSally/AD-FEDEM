@@ -5,6 +5,7 @@ from tqdm import tqdm
 import os
 import time
 import meshio
+from contextlib import nullcontext
 import Config as cfg
 from Network import ResNet
 from Dataset import Dataset
@@ -60,12 +61,16 @@ if __name__ == '__main__':
     torch.manual_seed(cfg.seed)
 
     data=Dataset(data_path=cfg.mesh_path, data_num=cfg.data_num, model_scale=cfg.model_scale)
-    batch = data.batch_fields(cfg.Dir_marker, cfg.Pre_marker, cfg.Sym_marker)
+    bucket_batches = data.batch_fields_bucketed(
+        cfg.Dir_marker, cfg.Pre_marker, cfg.Sym_marker, getattr(cfg, "bucket_num", 2)
+    )
+    total_grain_count = sum(b["grain_count"] for b in bucket_batches)
 
     # 定义神经网络，神经网络的输入为空间坐标，输出为三个方向的位移
     dem=ResNet(cfg.input_size, cfg.hidden_size, cfg.output_size, cfg.depth, cfg.data_num, cfg.latent_dim).to(dev)
     start_epoch=0
     dem.train()
+    loss = Loss(dem)
 
     # 开始训练, 设置训练参数
     start_time = time.time()
@@ -80,6 +85,10 @@ if __name__ == '__main__':
 
     # 定义学习率调度器
     lr_history = []
+    amp_enabled = bool(getattr(cfg, "use_amp", False) and dev.type == "cuda")
+    amp_dtype_name = getattr(cfg, "amp_dtype", "float16")
+    amp_dtype = torch.float16 if amp_dtype_name == "float16" else torch.bfloat16
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
     if cfg.lr_scheduler == 'Cos':
         # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.9)  # 每1000个epoch将学习率降低为原来的0.1倍
@@ -100,24 +109,39 @@ if __name__ == '__main__':
         Pre_load=get_Pre_load(epoch, cfg.Pre_value, cfg.Pre_step_interval)
         loss_weight=get_loss_weight(epoch, cfg.loss_weight, cfg.weight_step_interval)
 
-        total_loss = 0
-        total_eloss = 0
-        total_bloss = 0
+        total_loss = torch.tensor(0.0, device=dev)
+        total_eloss = torch.tensor(0.0, device=dev)
+        total_bloss = torch.tensor(0.0, device=dev)
         optimizer.zero_grad()
 
-        loss=Loss(dem)
-        total_loss, total_eloss, total_bloss = loss.loss_function_batch(
-            batch["grain_idx"],
-            batch["dom"], batch["dom_mask"],
-            batch["bc_dir"], batch["bc_dir_mask"],
-            batch["bc_pre"], batch["bc_pre_mask"],
-            batch["bc_sym"], batch["bc_sym_mask"],
-            Pre_load, loss_weight
-        )
+        for batch in bucket_batches:
+            bucket_weight = batch["grain_count"] / total_grain_count
+            amp_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_enabled) if amp_enabled else nullcontext()
+            with amp_ctx:
+                bucket_loss, bucket_eloss, bucket_bloss = loss.loss_function_batch(
+                    batch["grain_idx"],
+                    batch["dom"], batch["dom_mask"],
+                    batch["bc_dir"], batch["bc_dir_mask"],
+                    batch["bc_pre"], batch["bc_pre_mask"],
+                    batch["bc_sym"], batch["bc_sym_mask"],
+                    Pre_load, loss_weight
+                )
+                weighted_loss = bucket_loss * bucket_weight
+                total_loss = total_loss + weighted_loss.detach()
+                total_eloss = total_eloss + (bucket_eloss * bucket_weight).detach()
+                total_bloss = total_bloss + (bucket_bloss * bucket_weight).detach()
 
-        total_loss.backward()  # 反向传播
+            if amp_enabled:
+                scaler.scale(weighted_loss).backward()
+            else:
+                weighted_loss.backward()
+
         # 更新参数
-        optimizer.step()
+        if amp_enabled:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
         scheduler.step()  # 更新学习率
 
             # def closure():
@@ -130,7 +154,7 @@ if __name__ == '__main__':
             
             # optimizer.step(closure=closure)
 
-        losses.append(total_loss.item())
+        losses.append(float(total_loss.item()))
         lr_history.append(optimizer.param_groups[0]['lr'])
 
 

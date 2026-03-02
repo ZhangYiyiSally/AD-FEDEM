@@ -30,6 +30,39 @@ class Dataset:
             mask[i, :n] = True
         return padded, mask
 
+    def _pad_tensor_dict_by_indices(self, tensor_dict: dict, indices: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+        max_len = max(tensor_dict[i].shape[0] for i in indices)
+        sample = tensor_dict[indices[0]]
+        padded = torch.zeros(
+            (len(indices), max_len, *sample.shape[1:]),
+            dtype=sample.dtype,
+            device=self.dev,
+        )
+        mask = torch.zeros((len(indices), max_len), dtype=torch.bool, device=self.dev)
+        for local_i, grain_i in enumerate(indices):
+            n = tensor_dict[grain_i].shape[0]
+            padded[local_i, :n] = tensor_dict[grain_i]
+            mask[local_i, :n] = True
+        return padded, mask
+
+    def _build_batch_from_indices(self, indices: list[int], dom: dict, bc_dir: dict, bc_pre: dict, bc_sym: dict) -> dict:
+        dom_pad, dom_mask = self._pad_tensor_dict_by_indices(dom, indices)
+        dir_pad, dir_mask = self._pad_tensor_dict_by_indices(bc_dir, indices)
+        pre_pad, pre_mask = self._pad_tensor_dict_by_indices(bc_pre, indices)
+        sym_pad, sym_mask = self._pad_tensor_dict_by_indices(bc_sym, indices)
+        return {
+            "dom": dom_pad,
+            "dom_mask": dom_mask,
+            "bc_dir": dir_pad,
+            "bc_dir_mask": dir_mask,
+            "bc_pre": pre_pad,
+            "bc_pre_mask": pre_mask,
+            "bc_sym": sym_pad,
+            "bc_sym_mask": sym_mask,
+            "grain_idx": torch.tensor(indices, dtype=torch.long, device=self.dev),
+            "grain_count": len(indices),
+        }
+
     def batch_fields(self, Dir_marker: str, Pre_marker: str, Sym_marker: str) -> dict:
         dom = self.domain()
         bc_dir = self.bc_Dirichlet(Dir_marker)
@@ -52,6 +85,27 @@ class Dataset:
             "bc_sym_mask": sym_mask,
             "grain_idx": torch.arange(self.data_num, dtype=torch.long, device=self.dev),
         }
+
+    def batch_fields_bucketed(self, Dir_marker: str, Pre_marker: str, Sym_marker: str, bucket_num: int = 2) -> list[dict]:
+        dom = self.domain()
+        bc_dir = self.bc_Dirichlet(Dir_marker)
+        bc_pre = self.bc_Pressure(Pre_marker)
+        bc_sym = self.bc_Symmetry(Sym_marker)
+
+        if bucket_num <= 1 or self.data_num <= 1:
+            return [self._build_batch_from_indices(list(range(self.data_num)), dom, bc_dir, bc_pre, bc_sym)]
+
+        # Sort by dominant tetrahedral element count to reduce padding waste in each bucket.
+        sorted_indices = sorted(range(self.data_num), key=lambda i: dom[i].shape[0], reverse=True)
+        bucket_num = min(bucket_num, self.data_num)
+        step = (self.data_num + bucket_num - 1) // bucket_num
+
+        buckets = []
+        for start in range(0, self.data_num, step):
+            idx_chunk = sorted_indices[start:start + step]
+            buckets.append(self._build_batch_from_indices(idx_chunk, dom, bc_dir, bc_pre, bc_sym))
+
+        return buckets
 
     def domain(self) -> torch.Tensor:
         Tetra_coord = {}
