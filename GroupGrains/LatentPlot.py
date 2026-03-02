@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 # 加载模型
 
-model_path =f"DEFEM3D/GroupGrains/Results_Adam/DataNum6/Net4x3-256-3(16)_Exp0.0005_weight100000.0/dem_epoch100000.pth"
+model_path =f"GroupGrains/Results/DataNum5/x10_Net4x3-200-3(256)_Exp4e-04_0.9999/p[0.2-6.8-50000]xw[1e+05-1e+08-50000]/dem_epoch100000.pth"
 state_dict = torch.load(model_path)
 
 # 查找包含"latent_vectors"的键
