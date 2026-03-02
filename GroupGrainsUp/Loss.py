@@ -43,6 +43,7 @@ class Loss:
         loss_weight: float,
     ):
         self.data_idx_batch = grain_idx
+        self.Pre_load = Pre_load
         self.Pre_Triangle_coord_batch = Pre_coord
         self.Pre_mask_batch = Pre_mask
 
